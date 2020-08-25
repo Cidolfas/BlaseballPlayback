@@ -93,12 +93,19 @@ class BlaseballRecorder:
 	async def record(self):
 		self.start_time = datetime.now()
 		while self.connect_attempts < 5:
-			response = requests.get(self.uri, stream=True)
-			sse = sseclient.SSEClient(response)
-			await asyncio.gather(self.listen(sse))
-			self.connect_attempts += 1
-			print(f"{TColors.RED2}Reconnecting {self.connect_attempts}/5...{TColors.END}")
-			self.last_message = {}
+			try:
+				response = requests.get(self.uri, stream=True)
+				sse = sseclient.SSEClient(response)
+				await asyncio.gather(self.listen(sse))
+				self.connect_attempts += 1
+				print(f"{TColors.RED2}Reconnecting {self.connect_attempts}/5...{TColors.END}")
+				self.last_message = {}
+			except requests.exceptions.RequestException as e:
+				print(f"{TColors.RED2}REQUEST EXCEPTION:{TColors.END} {e.__class__}, reconnecting after a delay")
+				await asyncio.sleep(5 * self.connect_attempts)
+				self.connect_attempts += 1
+				print(f"{TColors.RED2}Reconnecting {self.connect_attempts}/5...{TColors.END}")
+				self.last_message = {}
 		self.write(self.messages)
 		sys.exit(0)
 
