@@ -33,7 +33,7 @@ class TColors:
 class BlaseballRecorder:
 	def __init__(self, filepath=None, uri=None):
 		self.filepath = filepath or "blaseballGame"
-		self.uri = uri or "https://www.blaseball.com/events/streamGameData"
+		self.uri = uri or "https://www.blaseball.com/events/streamData"
 		self.day_mode = False
 		self.skip_days = 0
 		self.messages = []
@@ -51,7 +51,7 @@ class BlaseballRecorder:
 			now = datetime.now()
 			time_since_start = now - self.start_time
 			data = json.loads(message.data)
-			cut_data = data["value"].copy()
+			cut_data = data["value"]["games"].copy()
 			lut = cut_data.pop("lastUpdateTime", -1)
 			if lut < self.last_update_time:
 				skips += 1
@@ -171,7 +171,7 @@ class BlaseballStreamer:
 					message = last_message_body
 				else:
 					last_message_body = message
-				self.http_games = message["value"]["schedule"]
+				self.http_games = message["value"]["games"]["schedule"]
 				next_message += 1
 			else:
 				await asyncio.sleep(0.05)
