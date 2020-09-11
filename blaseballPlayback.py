@@ -3,6 +3,7 @@
 import asyncio
 from aiohttp import web
 from aiohttp_sse import sse_response
+import gzip
 import sseclient
 import requests
 from datetime import datetime
@@ -185,12 +186,15 @@ class BlaseballRecorder:
 
 # This is the playback logic
 class BlaseballStreamer:
-	def __init__(self, filepath=None):
+	def __init__(self, filepath=None, archive=False):
 		# Load up the given filepath
-		filepath = filepath or "blaseballGame.stream"
-		file = open(filepath, 'r')
-		self.messages = json.load(file)
-		print(f"{TColors.RED}Loaded {TColors.YELLOW2}{len(self.messages)}{TColors.RED} messages from {TColors.GREEN2}{filepath}{TColors.RED}, last at {TColors.BLUE2}{self.messages[-1][0]:7.2f}{TColors.END}")
+		if not archive:
+			filepath = filepath or "blaseballGame.stream"
+			self.messages = FileQueue(filepath)
+			print(f"{TColors.RED}Loaded {TColors.YELLOW2}{len(self.messages)}{TColors.RED} messages from {TColors.GREEN2}{filepath}{TColors.RED}, last at {TColors.BLUE2}{self.messages.bottom()[0]:7.2f}{TColors.END}")
+		else:
+			# Load a compressed file from SIBR's s3 archives
+			self.messages = ArchiveQueue(filepath)
 		
 		# Default settings for playback
 		self.speed = 1.0
@@ -207,22 +211,21 @@ class BlaseballStreamer:
 	async def start_http_playback(self):
 		# Setup variables
 		start_time = datetime.now()
-		next_message = 0 # Index for self.messages
 		last_message_body = {}
 
 		print(f"{TColors.RED}Started HTTP playback{TColors.END}")
 
 		# While we still have messages left to show...
-		while len(self.messages) > next_message:
+		while not self.messages.is_empty():
 			# Are we past the timestamp of the next message?
 			now = datetime.now()
 			time_since_start = now - start_time
 			seconds = time_since_start.total_seconds() * self.speed
 
-			if seconds >= self.messages[next_message][0]:
+			if seconds >= self.messages.top()[0]:
 				# We are? Then update the current cache of what to show if somebody accesses the endpoint
-				print(f"{TColors.GREEN}HTTP: {TColors.BLUE}{self.messages[next_message][0]:7.2f}{TColors.END}/{self.messages[-1][0]:7.2f}\r")
-				message = self.messages[next_message][1]
+				print(f"{TColors.GREEN}HTTP: {TColors.BLUE}{self.messages.top()[0]:7.2f}{TColors.END}/{self.messages.bottom()[0]:7.2f}\r")
+				message = self.messages.top()[1]
 
 				if isinstance(message, int):
 					# If it's just an int, that means we have identical content to the previous message
@@ -235,7 +238,7 @@ class BlaseballStreamer:
 				self.http_games = message["value"]["games"]["schedule"]
 
 				# Advance
-				next_message += 1
+				self.messages.pop()
 			else:
 				# If we're not to the next message's timestamp yet, sleep for a bit
 				await asyncio.sleep(0.05)
@@ -263,28 +266,27 @@ class BlaseballStreamer:
 		async with sse_response(request) as resp:
 			# Setup variables
 			start_time = datetime.now()
-			next_message = 0 # Index for self.messages
 			last_message_body = {}
 
 			print(f"{TColors.RED}Started playback due to SSE connection{TColors.END}")
 
 			# While we still have messages left to show...
-			while len(self.messages) > next_message:
+			while not self.messages.is_empty():
 				# Are we past the timestamp of the next message?
 				now = datetime.now()
 				time_since_start = now - start_time
 				seconds = time_since_start.total_seconds() * self.speed
 
-				if seconds >= self.messages[next_message][0]:
+				if seconds >= self.messages.top()[0]:
 					# We are? Then send a new event
-					print(f"{TColors.GREEN}SSE: {TColors.BLUE2}{self.messages[next_message][0]:7.2f}/{self.messages[-1][0]:7.2f}{TColors.END}\r")
-					message = self.messages[next_message][1]
+					print(f"{TColors.GREEN}SSE: {TColors.BLUE2}{self.messages.top()[0]:7.2f}/{self.messages.bottom()[0]:7.2f}{TColors.END}\r")
+					message = self.messages.top()[1]
 
 					if isinstance(message, int):
 						# If it's just an int, that means we have identical content to the previous message
 						# Was used when the stream included lastUpdateTime to indicate we got a message with a new lastUpdateTime that was identical
 						message = last_message_body
-						message["value"]["lastUpdateTime"] = self.messages[next_message][1]
+						message["value"]["lastUpdateTime"] = self.messages.top()[1]
 					else:
 						last_message_body = message
 
@@ -292,7 +294,7 @@ class BlaseballStreamer:
 					await resp.send(json.dumps(message))
 
 					# Advance
-					next_message += 1
+					self.messages.pop()
 				else:
 					# If we're not to the next message's timestamp yet, sleep for a bit
 					await asyncio.sleep(0.05)
@@ -333,6 +335,122 @@ class BlaseballStreamer:
 			print(f"{TColors.BEIGE2}Received interrupt, shutting down stream{TColors.END}")
 			sys.exit(0)
 
+
+class FileQueue:
+	"""
+	Simple deque abstraction to easily peek top and advance messages.
+	"""
+	def __init__(self, data):
+		with open(data or "blaseballGame.stream", "r") as f:
+			self._data = json.load(f)
+		self._original_len = len(self._data)
+
+	def is_empty(self):
+		"""
+		Returns True if we have reached the end of file.
+		"""
+		return not self._data
+
+	def top(self):
+		"""
+		Returns the next (timedelta, payload) tuple without advancing the queue.
+		"""
+		if self.is_empty():
+			return None
+		return self._data[0]
+
+	def bottom(self):
+		"""
+		Returns the last (timedelta, payload) tuple.
+		"""
+		if self.is_empty():
+			return None
+		return self._data[-1]
+
+	def pop(self):
+		"""
+		Returns the next (timedelta, payload) and advances the queue.
+		"""
+		if self.is_empty():
+			return None
+		return self._data.pop(0)
+
+	def __len__(self):
+		"""
+		Return length of original log file.
+		"""
+		return self._original_len
+
+
+class ArchiveQueue(FileQueue):
+	"""
+	Decompresses a SIBR archive file reads the file one line at a time so as not to blow up RAM,
+	faking the timedelta for messages to get emitted every second (approximately in line with
+	what we get from prod)
+	"""
+
+	def __init__(self, data):
+		# data is a file name
+		self._data = gzip.open(data, mode='rt', encoding='utf-8')
+		self._cur_message = self._next_message()
+		if not self._cur_message:
+			# idk how we got here
+			return
+		self._start_ts = self._message_timestamp(self._cur_message)
+
+	def _next_message(self):
+		try:
+			msg = next(self._data)
+			self._cur_message = {'value': {'games': json.loads(msg)}}
+		except StopIteration:
+			self._cur_message = None
+		return self._cur_message
+
+	def _message_timestamp(self, msg):
+		return msg['value']['games']['clientMeta']['timestamp'] / 1000.0
+
+	def is_empty(self):
+		"""
+		Returns true of we have no more messages to load.
+		"""
+		return self._cur_message is None
+
+	def top(self):
+		"""
+		Returns next (timedelta, payload) tuple without advancing the queue.
+		"""
+		if self.is_empty():
+			return 0.0, None
+		return self._message_timestamp(self._cur_message) - self._start_ts, self._cur_message
+
+	def bottom(self):
+		"""
+		Dummy implementation so as not to break the log-based code.
+		"""
+		return 0.0, None
+
+	def pop(self):
+		"""
+		Returns next (timedelta, payload) tuple and advances the queue.
+		"""
+		next_message = self._cur_message
+		self._cur_message = self._next_message()
+		return self._message_timestamp(next_message) - self._start_ts, next_message
+
+	def __len__(self):
+		"""
+		Dummy implementaiotn so as not to break the log-based code.
+		"""
+		return 1
+
+	def __del__(self):
+		"""
+		Close log file on exit.
+		"""
+		if self._data:
+			self._data.close()
+
+
 # Handles starting us in record mode from the command line arguments
 def handle_record(args):
 	bbr = BlaseballRecorder(args.filepath, args.uri)
@@ -342,7 +460,7 @@ def handle_record(args):
 
 # Handles starting us in stream mode form the command line arguments
 def handle_stream(args):
-	bbs = BlaseballStreamer(args.filepath)
+	bbs = BlaseballStreamer(args.filepath, archive=args.archive)
 	bbs.speed = args.speed
 
 	# You can only be one of these
@@ -370,6 +488,7 @@ stream_parser.add_argument("-f", "--file", dest="filepath", help="Path to read t
 stream_parser.add_argument("--http", action="store_true", help="Use HTTP playback to localhost:8080/game for polling implementations")
 stream_parser.add_argument("--sse", action="store_true", help="Use SSE playback to localhost:8080/streamGameData for SSE implementation. If neither this or --http is given, default to this")
 stream_parser.add_argument("--speed", type=float, default=1.0, help="Playback rate, as a float")
+stream_parser.add_argument("--archive", action="store_true", help="specified playback file is an archive file from SIBR.")
 
 args = parser.parse_args()
 if args.func:
