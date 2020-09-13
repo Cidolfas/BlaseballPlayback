@@ -204,6 +204,7 @@ class BlaseballStreamer:
 		# Internals
 		self.webapp = web.Application()
 		self.http_games = []
+		self._sse_lock = False  # only one event stream can be open at a time due to mutable state in the playback queue.
 
 	# This holds the update logic for HTTP playback
 	# This will play back a stream in constant time, updating a cache of game data as it goes
@@ -262,48 +263,54 @@ class BlaseballStreamer:
 
 	# This method handles requests for /streamData as an eventSource
 	async def handle_sse(self, request):
-		# This sets up the eventSource stream
-		async with sse_response(request) as resp:
-			# Setup variables
-			start_time = datetime.now()
-			last_message_body = {}
+		if self._sse_lock:
+			raise Exception('Only one open stream is currently supported.')
+		try:
+			self._sse_lock = True
+			# This sets up the eventSource stream
+			async with sse_response(request) as resp:
+				# Setup variables
+				start_time = datetime.now()
+				last_message_body = {}
 
-			print(f"{TColors.RED}Started playback due to SSE connection{TColors.END}")
+				print(f"{TColors.RED}Started playback due to SSE connection{TColors.END}")
 
-			# While we still have messages left to show...
-			while not self.messages.is_empty():
-				# Are we past the timestamp of the next message?
-				now = datetime.now()
-				time_since_start = now - start_time
-				seconds = time_since_start.total_seconds() * self.speed
+				# While we still have messages left to show...
+				while not self.messages.is_empty():
+					# Are we past the timestamp of the next message?
+					now = datetime.now()
+					time_since_start = now - start_time
+					seconds = time_since_start.total_seconds() * self.speed
 
-				if seconds >= self.messages.top()[0]:
-					# We are? Then send a new event
-					print(f"{TColors.GREEN}SSE: {TColors.BLUE2}{self.messages.top()[0]:7.2f}/{self.messages.bottom()[0]:7.2f}{TColors.END}\r")
-					message = self.messages.top()[1]
+					if seconds >= self.messages.top()[0]:
+						# We are? Then send a new event
+						print(f"{TColors.GREEN}SSE: {TColors.BLUE2}{self.messages.top()[0]:7.2f}/{self.messages.bottom()[0]:7.2f}{TColors.END}\r")
+						message = self.messages.top()[1]
 
-					if isinstance(message, int):
-						# If it's just an int, that means we have identical content to the previous message
-						# Was used when the stream included lastUpdateTime to indicate we got a message with a new lastUpdateTime that was identical
-						message = last_message_body
-						message["value"]["lastUpdateTime"] = self.messages.top()[1]
+						if isinstance(message, int):
+							# If it's just an int, that means we have identical content to the previous message
+							# Was used when the stream included lastUpdateTime to indicate we got a message with a new lastUpdateTime that was identical
+							message = last_message_body
+							message["value"]["lastUpdateTime"] = self.messages.top()[1]
+						else:
+							last_message_body = message
+
+						# Actually send the event
+						await resp.send(json.dumps(message))
+
+						# Advance
+						self.messages.pop()
 					else:
-						last_message_body = message
+						# If we're not to the next message's timestamp yet, sleep for a bit
+						await asyncio.sleep(0.05)
 
-					# Actually send the event
-					await resp.send(json.dumps(message))
+				# We've hit the end of the stream
+				print(f"{TColors.RED}Finished SSE playback{TColors.END}")
 
-					# Advance
-					self.messages.pop()
-				else:
-					# If we're not to the next message's timestamp yet, sleep for a bit
-					await asyncio.sleep(0.05)
-
-			# We've hit the end of the stream
-			print(f"{TColors.RED}Finished SSE playback{TColors.END}")
-
-		# Close connection
-		return resp
+			# Close connection
+			return resp
+		finally:
+			self._sse_lock = False
 
 	# This method starts us up in http mode
 	async def start_http(self):
